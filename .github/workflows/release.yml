@@ -1,0 +1,80 @@
+name: Release Charts
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v2
+        with:
+          fetch-depth: 0
+
+      - name: Configure Git
+        run: |
+          git config user.name "$GITHUB_ACTOR"
+          git config user.email "$GITHUB_ACTOR@users.noreply.github.com"
+
+      - name: Prepare GPG key
+        run: |
+          gpg_dir=.cr-gpg
+          mkdir "$gpg_dir"
+          keyring="$gpg_dir/secring.gpg"
+          base64 -d <<< "$GPG_KEYRING_BASE64" > "$keyring"
+          passphrase_file="$gpg_dir/passphrase"
+          echo "$GPG_PASSPHRASE" > "$passphrase_file"
+          echo "CR_PASSPHRASE_FILE=$passphrase_file" >> "$GITHUB_ENV"
+          echo "CR_KEYRING=$keyring" >> "$GITHUB_ENV"
+        env:
+          GPG_KEYRING_BASE64: "${{ secrets.GPG_KEYRING_BASE64 }}"
+          GPG_PASSPHRASE: "${{ secrets.GPG_PASSPHRASE }}"
+
+      - name: Set up Go
+        uses: actions/setup-go@v2
+        with:
+          go-version: '^1.16'
+
+      - name: Install chartsec
+        run: go install github.com/banzaicloud/chartsec/cmd/chartsec@latest
+
+      - name: Package and scan charts
+        run: |
+          mkdir -p .cr-release-packages
+          for chart in charts/*; do
+            if [ -f "$chart/Chart.yaml" ]; then
+              helm package "$chart" --destination .cr-release-packages
+              chart_tgz=$(ls .cr-release-packages/${chart##*/}*.tgz)
+              echo "Scanning $chart_tgz"
+              chartsec_output=$(chartsec "$chart_tgz")
+              echo "$chartsec_output"
+            else
+              echo "Skipping $chart as it does not contain a Chart.yaml file"
+            fi
+          done
+
+      - name: Run chart-releaser (skip upload)
+        uses: helm/chart-releaser-action@v1.6.0
+        with:
+          config: cr.yml
+          skip_upload: true
+        env:
+          CR_TOKEN: "${{ secrets.GITHUB_TOKEN }}"
+
+      - name: List files in .cr-release-packages directory
+        run: ls -l .cr-release-packages
+
+      - name: Add MD5 checksum to .prov files
+        run: |
+          for prov_file in .cr-release-packages/*.prov; do
+            tgz_file="${prov_file%.tgz.prov}.tgz"
+            tgz_file="${tgz_file/.cr-release-packages\//.cr-release-packages\/}"
+            echo "Processing $tgz_file and $prov_file"
+            md5_checksum=$(md5sum "$tgz_file" | awk '{ print $1 }')
+            echo "md5: $md5_checksum" >> "$prov_file"
+            echo "Updated $prov_file with checksum:"
+            cat "$prov_file"
+          done
